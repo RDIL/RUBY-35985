@@ -3,7 +3,10 @@
 A RubyMine plugin that works around a defect in RubyMine's anonymous-symbol identity which can stop
 Ruby code analysis from ever completing, and reports on what analysis is doing while it happens.
 
-Built for RubyMine 2026.2 (`build 262.*`). No Gradle — plain `javac` against the IDE's own jars.
+Built for RubyMine 2026.2 (`build 262.*`) with Gradle and the
+[IntelliJ Platform Gradle Plugin](https://plugins.jetbrains.com/docs/intellij/tools-intellij-platform-gradle-plugin.html),
+laid out after the
+[IntelliJ Platform Plugin Template](https://github.com/JetBrains/intellij-platform-plugin-template).
 
 ## The defect
 
@@ -96,8 +99,10 @@ edit because RubyMine already ships `-Djdk.attach.allowAttachSelf=true`.
 
 `ProbeState` (measurement) and `ProbePatch` (the fix) are JDK-only and are appended to the
 **bootstrap** classloader, so there is exactly one copy: the instrumented Ruby code in its module
-classloader and the tool window in the plugin classloader see the same statics. `build.sh` asserts
-they are *not* also on the plugin classpath, because two copies would silently split the state.
+classloader and the tool window in this plugin's classloader see the same statics. Two copies would
+silently split the state, so that invariant is expressed in the build as a separate `bootstrap` source
+set which is on `compileClasspath` only — never packaged, never on a runtime classpath — and asserted
+by the `verifyPluginLayout` task.
 
 The boot jar is embedded as a resource inside the plugin jar and unpacked to a temp file. IntelliJ's
 `PathClassLoader` does not populate a usable `CodeSource` location, so deriving the path from disk is
@@ -114,43 +119,56 @@ If the weaving of `getAncestorsCaching` ever fails, the tool window says so outr
 
 ## Build
 
-Requires a JDK 21+ and a local RubyMine install (the plugin compiles against the IDE's own jars,
-which are not redistributable and are not committed).
-
 ```sh
-./fetch-libs.sh   # ByteBuddy into libs/, verified against pinned SHA-256 digests
-./build.sh        # -> out/ruby-analysis-probe-<version>.zip
-./test.sh
+./gradlew build          # compile, test, verify layout
+./gradlew buildPlugin    # -> build/distributions/ruby-analysis-probe-<version>.zip
+./gradlew test           # JUnit 5 only
+./gradlew runIde         # launch a sandboxed RubyMine with the plugin loaded
 ```
 
-Both paths are auto-detected and overridable:
+Requires JDK 21 (the Foojay toolchain resolver will provision one if absent) and a local RubyMine
+install — the plugin compiles against the IDE's own jars, including the bundled Ruby plugin, which are
+not redistributable and are not vendored here. `RubyMine.app` is auto-detected in the usual places;
+override with:
 
 ```sh
-JAVA_HOME=/path/to/jdk RUBYMINE_HOME=/path/to/RubyMine.app/Contents ./build.sh
+./gradlew build -PplatformLocalPath=/Applications/RubyMine.app
 ```
 
-Install via **Settings → Plugins → ⚙ → Install Plugin from Disk…**, pointing at the zip. Restart,
-then open **View → Tool Windows → Ruby Probe** and check the `runtime patch` block.
+Install via **Settings → Plugins → ⚙ → Install Plugin from Disk…**, pointing at the zip from
+`buildPlugin`. Restart, then open **View → Tool Windows → Ruby Probe** and check the `runtime patch`
+block.
+
+### Deliberate deviations from the template
+
+- **Java, not Kotlin.** All sources are Java and `ProbeState`/`ProbePatch` must stay strictly JDK-only,
+  so the Kotlin plugin would contribute nothing but a stdlib that must not be bundled.
+- **A local platform rather than a downloaded one.** The plugin needs RubyMine's bundled Ruby plugin;
+  resolving against the installed IDE keeps the build honest about what it compiles against and avoids
+  a multi-gigabyte download.
+- **No `TestFrameworkType.Platform`.** The tests are plain JUnit 5 exercising bytecode weaving; they
+  need no IDE fixture, sandbox, or application.
 
 ## Tests
 
-`./test.sh` runs three suites (23 assertions) against stand-ins carrying RubyMine's exact signatures,
-driven through real ByteBuddy weaving:
+`./gradlew test` — JUnit 5, single-forked because the patch state is static and shared.
 
-- **PatchTest** — the cycle terminates; the cut returns a non-null empty list; it fires at the first
-  repeat rather than after deep expansion; non-anonymous symbols are never cut; 50 exceptions do not
-  leak the per-thread depth (`ProcessCanceledException` is routine on this path); empty anonymous
-  lookups get suppressed while ordinary keys always reach the index; and **with the patch switched
-  off the cycle runs away again**, so a pass cannot come from the stand-in terminating on its own.
-- **SmokeTest** — the measurement side: symbol naming, recursion depth, the independent stack sampler,
-  histograms, and source-location recovery from what the index returned.
-- **InstallerTest** — drives the real `ProbeInstaller` against the built jar with the boot jar *not* on
-  the classpath and the IntelliJ classes absent, which is the boot-jar-location regression that bit
-  once already.
+- **`AnonymousCycleCutTest`** — the cycle terminates; the cut returns a non-null empty list; it fires
+  at the first repeat rather than after deep expansion; non-anonymous symbols are never cut; 50
+  exceptions do not leak the per-thread depth (`ProcessCanceledException` is routine on this path);
+  the advice is genuinely woven; and **with cutting disabled the cycle runs away again**, so a pass
+  cannot come from the stand-in terminating on its own.
+- **`NegativeLookupCacheTest`** — anonymous keys stop reaching the index after the confirming lookups,
+  ordinary keys always reach it, and disabling the cache restores every lookup.
+- **`ProbeInstallerTest`** — the boot jar is reachable as a classpath resource, the bootstrap classes
+  are *not* also on the application classpath, `installOnce()` reports `installed`, and the toggles
+  round-trip.
 
-The stand-ins reproduce the *defect*, not merely a deep call: they alternate between an anonymous
-symbol and its singleton, building a fresh `Symbol` instance every time, which is precisely why
-RubyMine's own guards fail to break the cycle.
+`SymbolHierarchyStub` reproduces the *defect*, not merely a deep call: it alternates between an
+anonymous symbol and its singleton, building a fresh `Symbol` instance every time, which is precisely
+why RubyMine's own guards fail to break the cycle. `ProbeFixture` installs the agent the way
+`ProbeInstaller` does — self-attach, append the boot jar to the bootstrap loader, then weave — so the
+tests drive the real advice through real ByteBuddy weaving.
 
 ## Runtime knobs
 
@@ -167,23 +185,25 @@ Toggles in the tool window, or system properties in `Help → Edit Custom VM Opt
 | `rubyprobe.pkg` | `org.jetbrains.plugins.ruby` | package prefix the stack sampler matches |
 
 **Measure** turns off the per-resolution bookkeeping while leaving both patches active — worth doing
-for daily use, since the measurement now runs on every ancestor resolution.
+for daily use, since the measurement runs on every ancestor resolution.
 
 ## Layout
 
 ```
-boot/       ProbeState (measurement) + ProbePatch (the fix) -- JDK-only, bootstrap-loaded
-plugin/     advice, agent installer, tool window -- compiled against RubyMine's jars
-resources/  META-INF/plugin.xml
-smoke/      PatchTest, SmokeTest, InstallerTest
-env.sh      JDK / RubyMine / ByteBuddy discovery, shared by build.sh and test.sh
+src/bootstrap/java/   ProbeState (measurement) + ProbePatch (the fix) -- JDK-only, bootstrap-loaded
+src/main/java/        advice, agent installer, tool window -- compiled against RubyMine's jars
+src/main/resources/   META-INF/plugin.xml
+src/test/java/        JUnit 5 tests, stand-ins, and the agent fixture
 ```
 
 ## Caveats
 
-- Pinned to `since-build="262" until-build="262.*"`. It instruments private internals by name; a
+- Pinned to `sinceBuild=262` / `untilBuild=262.*`. It instruments private internals by name; a
   RubyMine upgrade can move them, and the reported weaving status is how you find out.
 - Everything above about `SymbolHierarchy` and `AnonymousDefiningCallType` came from reading shipped
   bytecode (`javap -c -p` on `intellij.ruby.backend.jar` and `intellij.ruby.psi.impl.jar`).
+- The patches are verified against stand-ins carrying RubyMine's exact signatures, driven through real
+  ByteBuddy weaving. Whether `intellij.ruby.backend.jar` accepts the transform **inside the IDE** is a
+  separate question, which the tool window answers on first load.
 - Not a general-purpose plugin. It exists to keep one large Rails codebase analysable while the
   upstream defect is open.

@@ -1,9 +1,11 @@
+.gradle/
+build/
 out/
-*.class
-
-# ~9.3MB of ByteBuddy, fetched and digest-verified by ./fetch-libs.sh.
-# To vendor them instead, delete these two lines and commit libs/.
-libs/*.jar
 
 .DS_Store
-.idea/
+
+# IntelliJ project files, except the shared run configurations
+.idea/*
+!.idea/runConfigurations/
+
+.intellijPlatform
