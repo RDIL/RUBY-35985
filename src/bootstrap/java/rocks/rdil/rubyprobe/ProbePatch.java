@@ -69,9 +69,15 @@ public final class ProbePatch {
     private static final int SANITY_DEPTH = 4096;
 
     private static final long NEG_TTL_NS =
-        intProperty("rubyprobe.negTtlMillis", 2000) * 1_000_000L;
+        intProperty("rubyprobe.negTtlMillis", 5000) * 1_000_000L;
     private static final int NEG_MIN_ZEROS = intProperty("rubyprobe.negMinZeros", 3);
-    private static final int NEG_MAX_KEYS = 512;
+    /**
+     * Sized for a codebase that generates anonymous symbols in bulk. The first field measurement hit
+     * 387 armed keys against an earlier cap of 512 while the report's key table was full at 2048
+     * distinct keys, i.e. the cache was rationing itself out of usefulness on the workload it exists
+     * for. Each entry is a String plus a two-element long[].
+     */
+    private static final int NEG_MAX_KEYS = intProperty("rubyprobe.negMaxKeys", 16384);
 
     private static final AtomicLong ENTERS = new AtomicLong();
     private static final AtomicLong ANON_ENTERS = new AtomicLong();
@@ -291,7 +297,20 @@ public final class ProbePatch {
             sb.append("  last cut                    : ").append(lastCut).append('\n');
         }
         sb.append("  empty lookups suppressed    : ").append(NEG_SERVED.get())
-          .append("   (keys armed: ").append(NEG_ARMED.get()).append(")\n");
+          .append("   (keys armed: ").append(NEG_ARMED.get())
+          .append(" of ").append(NEG_MAX_KEYS).append(" max, ").append(ZEROS.size())
+          .append(" tracked)\n");
+        String adviceError = null;
+        try {
+            adviceError = System.getProperty("rubyprobe.adviceError");
+        } catch (Throwable ignored) {
+            // best effort
+        }
+        if (adviceError != null) {
+            sb.append("  ADVICE LINKAGE ERROR        : ").append(adviceError).append('\n');
+        } else if (enters == 0L) {
+            sb.append("  (no linkage error recorded, so the advice is absent, not failing)\n");
+        }
         if (FRAME_RESETS.get() > 0L) {
             sb.append("  frame resets                : ").append(FRAME_RESETS.get()).append('\n');
         }

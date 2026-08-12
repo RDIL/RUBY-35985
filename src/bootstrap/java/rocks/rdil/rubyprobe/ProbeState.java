@@ -34,7 +34,7 @@ public final class ProbeState {
     private static final long STALE_NS = 2_000_000_000L;
 
     /** Cap on distinct stub keys tracked, so a high-cardinality workload cannot grow unbounded. */
-    private static final int MAX_TRACKED_KEYS = 2048;
+    private static final int MAX_TRACKED_KEYS = 16384;
 
     private static final String ANCESTORS_METHOD = "getAncestorsCaching";
     /** Overridable so the sampler can be exercised against stand-ins under test. */

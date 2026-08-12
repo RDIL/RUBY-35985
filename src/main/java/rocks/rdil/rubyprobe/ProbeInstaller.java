@@ -3,6 +3,9 @@ package rocks.rdil.rubyprobe;
 import net.bytebuddy.agent.ByteBuddyAgent;
 import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.asm.Advice;
+import net.bytebuddy.description.method.MethodDescription;
+import net.bytebuddy.description.type.TypeDescription;
+import net.bytebuddy.matcher.ElementMatcher;
 import net.bytebuddy.matcher.ElementMatchers;
 
 import java.io.File;
@@ -29,6 +32,11 @@ public final class ProbeInstaller {
         "org.jetbrains.plugins.ruby.ruby.lang.psi.indexes.RubyStringStubIndexExtension";
     private static final String PROBE_STATE = "rocks.rdil.rubyprobe.ProbeState";
     private static final String PLUGIN_ID = "rocks.rdil.ruby-analysis-probe";
+
+    /** Held as a field so the same matcher is both counted and applied -- no drift between them. */
+    private static final ElementMatcher.Junction<MethodDescription> ANCESTORS_METHOD =
+        ElementMatchers.<MethodDescription>named("getAncestorsCaching")
+            .and(ElementMatchers.takesArguments(2));
 
     private static final AtomicBoolean INSTALLED = new AtomicBoolean(false);
     private static volatile String status = "not installed";
@@ -87,10 +95,15 @@ public final class ProbeInstaller {
                 .with(AgentBuilder.RedefinitionStrategy.RETRANSFORMATION)
                 .with(new WeaveListener())
                 .type(ElementMatchers.named(SYMBOL_HIERARCHY))
-                .transform((builder, type, loader, module, pd) -> builder.visit(
-                    Advice.to(AncestorsCutAdvice.class)
-                        .on(ElementMatchers.named("getAncestorsCaching")
-                            .and(ElementMatchers.takesArguments(2)))))
+                .transform((builder, type, loader, module, pd) -> {
+                    // onTransformation fires when the TYPE matches, even if the method matcher
+                    // matches nothing -- which is exactly how "wove SymbolHierarchy" and "advice
+                    // never invoked" have both been true. Count the matches here so the report says
+                    // which of the two it is instead of leaving it to inference.
+                    reportMethodMatch(type, ANCESTORS_METHOD);
+                    return builder.visit(
+                        Advice.to(AncestorsCutAdvice.class).on(ANCESTORS_METHOD));
+                })
                 .type(ElementMatchers.named(STRING_STUB_INDEX))
                 .transform((builder, type, loader, module, pd) -> builder.visit(
                     Advice.to(StubKeyAdvice.class)
@@ -157,6 +170,34 @@ public final class ProbeInstaller {
             } catch (Throwable t) {
                 note(simple(target) + " retransform failed: " + t.getClass().getSimpleName());
             }
+        }
+    }
+
+    /**
+     * Records how many of the type's declared methods the advice matcher actually selects, and names
+     * the near misses when it selects none. A matcher that matches zero methods is silent otherwise:
+     * the transformation still "succeeds" and the advice simply is not there.
+     */
+    private static void reportMethodMatch(TypeDescription type,
+                                          ElementMatcher<? super MethodDescription> matcher) {
+        try {
+            int declared = 0;
+            int matched = 0;
+            StringBuilder nearMisses = new StringBuilder();
+            for (MethodDescription.InDefinedShape m : type.getDeclaredMethods()) {
+                declared++;
+                if (matcher.matches(m)) {
+                    matched++;
+                } else if (m.getName().contains("ncestors") && nearMisses.length() < 400) {
+                    nearMisses.append("\n      ").append(m.getName())
+                        .append('/').append(m.getParameters().size())
+                        .append(m.isStatic() ? " static" : "");
+                }
+            }
+            note(simple(type.getName()) + ": " + matched + " of " + declared + " methods matched"
+                + (matched == 0 ? " -- ADVICE WILL NOT BE APPLIED. Candidates:" + nearMisses : ""));
+        } catch (Throwable t) {
+            note("could not enumerate methods of " + simple(type.getName()) + ": " + t);
         }
     }
 

@@ -1,11 +1,9 @@
-import org.jetbrains.changelog.Changelog
 import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
 
 plugins {
     java
     id("org.jetbrains.intellij.platform")
-    id("org.jetbrains.changelog")
 }
 
 // Java, not Kotlin: this is a deliberate deviation from the IntelliJ Platform Plugin Template. The
@@ -48,10 +46,10 @@ sourceSets {
     // compileClasspath only, never runtimeClasspath: main and test may *reference* the bootstrap
     // classes, but must resolve them at runtime through the bootstrap loader, exactly as in the IDE.
     main {
-        compileClasspath += bootstrap.output
+        compileClasspath += (bootstrap as SourceSet).output
     }
     test {
-        compileClasspath += bootstrap.output
+        compileClasspath += (bootstrap as SourceSet).output
     }
 }
 
@@ -107,23 +105,8 @@ intellijPlatform {
             sinceBuild = providers.gradleProperty("pluginSinceBuild")
             untilBuild = providers.gradleProperty("pluginUntilBuild")
         }
-        changeNotes = provider {
-            with(changelog) {
-                renderItem(
-                    (getOrNull(project.version.toString()) ?: getUnreleased())
-                        .withHeader(false)
-                        .withEmptySections(false),
-                    Changelog.OutputType.HTML,
-                )
-            }
-        }
+        changeNotes = "bugs were probably fixed"
     }
-}
-
-changelog {
-    version = project.version.toString()
-    groups.empty()
-    repositoryUrl = providers.gradleProperty("pluginRepositoryUrl")
 }
 
 tasks.test {
@@ -240,7 +223,7 @@ val localPluginsDir: File = providers.gradleProperty("localPluginsDir").orNull
  */
 val installLocal = tasks.register<Sync>("installLocal") {
     description = "Installs the built plugin into the local RubyMine $targetIdeVersion plugins directory."
-    group = "intellij platform"
+    group = tasks.getByName("runIde").group
 
     val buildPluginTask = tasks.named<Zip>("buildPlugin")
     dependsOn(buildPluginTask)
@@ -263,10 +246,14 @@ val installLocal = tasks.register<Sync>("installLocal") {
     val allowRunningIde = providers.gradleProperty("allowRunningIde")
         .map { it.toBoolean() }.orElse(false)
 
+    val pluginsDirExisted = localPluginsDir.isDirectory
+
+    outputs.upToDateWhen { false }
+
     doFirst {
-        if (!pluginsDir.isDirectory) {
+        if (!pluginsDirExisted) {
             error(
-                "No RubyMine $targetIdeVersion plugins directory at:\n  $pluginsDir\n" +
+                "No RubyMine $ideVersion plugins directory at:\n  $pluginsDir\n" +
                     "Point it somewhere real with -PlocalPluginsDir=/path/to/plugins"
             )
         }
@@ -284,7 +271,7 @@ val installLocal = tasks.register<Sync>("installLocal") {
     }
 
     doLast {
-        logger.lifecycle("installed into $pluginsDir/${rootProject.name}")
+        logger.lifecycle("installed into $pluginsDir/$pluginDirName")
         logger.lifecycle("start RubyMine, then check the 'runtime patch' block in the Ruby Probe tool window")
     }
 }

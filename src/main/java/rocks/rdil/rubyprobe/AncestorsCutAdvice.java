@@ -27,8 +27,19 @@ public final class AncestorsCutAdvice {
      */
     @Advice.OnMethodEnter(suppress = Throwable.class, skipOn = Advice.OnNonDefaultValue.class)
     public static boolean enter(@Advice.Argument(0) Object symbol) {
-        ProbeState.enterAncestors(symbol);
-        return ProbePatch.enterAncestors(symbol);
+        // The catch exists to tell two very different failures apart, because `suppress` hides both:
+        // an advice that was never inlined, and an advice that runs but cannot link ProbePatch from
+        // the Ruby module's classloader. java.lang.System resolves from any classloader, so if this
+        // property ever appears the advice IS in the method and the problem is linkage. If neither
+        // this nor the entry counter ever moves, the advice was never woven into the method at all.
+        // Costs nothing unless it is already broken.
+        try {
+            ProbeState.enterAncestors(symbol);
+            return ProbePatch.enterAncestors(symbol);
+        } catch (Throwable t) {
+            System.setProperty("rubyprobe.adviceError", t.getClass().getName() + ": " + t.getMessage());
+            return false;
+        }
     }
 
     /**

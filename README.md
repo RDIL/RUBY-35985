@@ -124,6 +124,18 @@ If the weaving of `getAncestorsCaching` ever fails, the tool window says so outr
 ./gradlew buildPlugin    # -> build/distributions/ruby-analysis-probe-<version>.zip
 ./gradlew test           # JUnit 5 only
 ./gradlew runIde         # launch a sandboxed RubyMine with the plugin loaded
+./gradlew installLocal   # install into the real RubyMine, replacing any existing copy
+```
+
+`installLocal` explodes the distribution into the local RubyMine plugins directory, then you restart the
+IDE. The target is derived from `pluginSinceBuild` (262 → `RubyMine2026.2`) rather than guessed, since
+machines usually have several config directories and installing a 262-only plugin into 2026.1's would
+look like a silent failure. It refuses to run while RubyMine is up, because replacing jars underneath a
+live IDE leaves it holding half the old plugin:
+
+```sh
+./gradlew installLocal -PlocalPluginsDir=/path/to/plugins   # override the target
+./gradlew installLocal -PallowRunningIde=true               # if the process check is wrong
 ```
 
 Requires JDK 21 (the Foojay toolchain resolver will provision one if absent) and a local RubyMine
