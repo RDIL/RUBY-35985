@@ -14,6 +14,13 @@
 - Tool window toggles for both patches, plus `Measure` to drop the per-resolution bookkeeping while
   leaving the patches active.
 
+### Fixed
+
+- The tool window no longer jumps to the bottom right of the text area on every refresh. `setText`
+  moves a `DefaultCaret` on its default `UPDATE_WHEN_ON_EDT` policy to the end of the new document,
+  which then scrolls itself into view; the caret is now frozen with `NEVER_UPDATE`. Both scrollbars are
+  also preserved across the update, clamped to `maximum - visibleAmount` rather than `maximum`.
+
 ### Changed
 
 - Advice now references the bootstrap-loaded state directly instead of a `BiConsumer` parked in

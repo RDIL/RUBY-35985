@@ -17,12 +17,21 @@ version = providers.gradleProperty("version").get()
 
 java {
     // 25, not 21: RubyMine 2026.2's platform jars are class file version 69 (Java 25), and a JDK 21
-    // javac cannot read them at all -- "class file has wrong version 69.0, should be 65.0". The IDE
-    // runs on JBR 25, so this also matches what the woven code will execute on.
+    // javac cannot read them at all -- "class file has wrong version 69.0, should be 65.0".
     toolchain {
         languageVersion = JavaLanguageVersion.of(25)
     }
 }
+
+// verifyPluginProjectConfiguration emits two warnings here that cannot both be satisfied, because its
+// own tables disagree: it maps platform 2026.2.1 to Java 25, but since-build=262 to Java 21. The
+// platform is the substantive constraint -- its jars are class file 69 and it runs on JBR 25 -- so
+// targeting 25 is correct and the since-build mapping is simply stale for build 262. Targeting 21
+// works too (untilBuild pins this to 262.*, which always runs JBR 25); it just trades one warning for
+// the other.
+//
+// The `until-build` warning is also deliberate. Forward compatibility is exactly what this plugin must
+// NOT claim: it instruments private RubyMine internals by name, and a platform upgrade can move them.
 
 /**
  * ProbeState and ProbePatch are appended to the BOOTSTRAP classloader at runtime, so that the
@@ -126,7 +135,12 @@ tasks.test {
 
     // ByteBuddyAgent self-attaches. RubyMine itself ships -Djdk.attach.allowAttachSelf=true, so the
     // test JVM is configured the same way rather than relying on the helper-process fallback.
-    jvmArgs("-Djdk.attach.allowAttachSelf=true", "-XX:+EnableDynamicAgentLoading")
+    // headless so the Swing scroll tests cannot touch a display.
+    jvmArgs(
+        "-Djdk.attach.allowAttachSelf=true",
+        "-XX:+EnableDynamicAgentLoading",
+        "-Djava.awt.headless=true",
+    )
 
     // Every test shares one JVM and ProbePatch's statics, so weaving happens once and the guard
     // state is reset per test. Parallel execution would make that racy.
@@ -154,8 +168,9 @@ val verifyPluginLayout = tasks.register("verifyPluginLayout") {
     group = "verification"
 
     // composedJar, not jar: composedJar is the artifact the IntelliJ Platform plugin actually ships,
-    // so that is the one whose layout matters.
-    val pluginJar = tasks.named<Jar>("composedJar").flatMap { it.archiveFile }
+    // so that is the one whose layout matters. It extends org.gradle.jvm.tasks.Jar -- the base type,
+    // not the org.gradle.api.tasks.bundling.Jar that `Jar` resolves to in this script.
+    val pluginJar = tasks.named<org.gradle.jvm.tasks.Jar>("composedJar").flatMap { it.archiveFile }
     inputs.file(pluginJar).withPropertyName("pluginJar")
     outputs.upToDateWhen { true }
 
@@ -188,4 +203,88 @@ val verifyPluginLayout = tasks.register("verifyPluginLayout") {
 
 tasks.check {
     dependsOn(verifyPluginLayout)
+}
+
+/**
+ * The IDE whose config directory `installLocal` writes to, derived from pluginSinceBuild rather than
+ * picked by guesswork: build 262 is 2026.2. There is usually more than one RubyMine config directory
+ * on a machine, and installing a 262-only plugin into 2026.1's would look like it silently failed.
+ */
+val targetIdeVersion: String = providers.gradleProperty("pluginSinceBuild").get().trim().let { since ->
+    Regex("""^(\d{2})(\d)$""").matchEntire(since)
+        ?.let { "20${it.groupValues[1]}.${it.groupValues[2]}" }
+        ?: error("cannot derive an IDE version from pluginSinceBuild='$since'")
+}
+
+val localPluginsDir: File = providers.gradleProperty("localPluginsDir").orNull
+    ?.takeIf { it.isNotBlank() }
+    ?.let { file(it) }
+    ?: System.getProperty("user.home").let { home ->
+        val os = System.getProperty("os.name").lowercase()
+        when {
+            os.contains("mac") ->
+                file("$home/Library/Application Support/JetBrains/RubyMine$targetIdeVersion/plugins")
+            os.contains("win") ->
+                file("${System.getenv("APPDATA")}/JetBrains/RubyMine$targetIdeVersion/plugins")
+            else ->
+                file("$home/.local/share/JetBrains/RubyMine$targetIdeVersion")
+        }
+    }
+
+/**
+ * `./gradlew installLocal` -- the equivalent of unzipping the distribution over the installed copy.
+ *
+ * Sync rather than Copy so stale files are removed: the pre-Gradle layout had a top-level boot/
+ * directory and an unversioned jar, and leaving those behind would be confusing at best. Sync's
+ * deletion is scoped to this plugin's own directory, never the plugins directory as a whole.
+ */
+val installLocal = tasks.register<Sync>("installLocal") {
+    description = "Installs the built plugin into the local RubyMine $targetIdeVersion plugins directory."
+    group = "intellij platform"
+
+    val buildPluginTask = tasks.named<Zip>("buildPlugin")
+    dependsOn(buildPluginTask)
+
+    from(zipTree(buildPluginTask.flatMap { it.archiveFile })) {
+        // Strip the archive's own top-level directory so its contents land directly in the target.
+        eachFile {
+            relativePath = RelativePath(true, *relativePath.segments.drop(1).toTypedArray())
+        }
+        includeEmptyDirs = false
+    }
+    into(localPluginsDir.resolve(rootProject.name))
+
+    // Locals, not the script-level values: a task action that reaches back to `rootProject` or to a
+    // script property captures a Gradle script object reference, which the configuration cache
+    // refuses to serialize.
+    val pluginsDir = localPluginsDir
+    val pluginDirName = rootProject.name
+    val ideVersion = targetIdeVersion
+    val allowRunningIde = providers.gradleProperty("allowRunningIde")
+        .map { it.toBoolean() }.orElse(false)
+
+    doFirst {
+        if (!pluginsDir.isDirectory) {
+            error(
+                "No RubyMine $targetIdeVersion plugins directory at:\n  $pluginsDir\n" +
+                    "Point it somewhere real with -PlocalPluginsDir=/path/to/plugins"
+            )
+        }
+        // Replacing jars under a live IDE leaves it holding half the old plugin, and it needs a
+        // restart to pick up the new one regardless.
+        val running = ProcessHandle.allProcesses().anyMatch {
+            it.info().command().orElse("").lowercase().contains("rubymine")
+        }
+        if (running && !allowRunningIde.get()) {
+            error(
+                "RubyMine appears to be running. Quit it first, or pass -PallowRunningIde=true if " +
+                    "that detection is wrong."
+            )
+        }
+    }
+
+    doLast {
+        logger.lifecycle("installed into $pluginsDir/${rootProject.name}")
+        logger.lifecycle("start RubyMine, then check the 'runtime patch' block in the Ruby Probe tool window")
+    }
 }

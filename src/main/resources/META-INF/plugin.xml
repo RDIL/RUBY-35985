@@ -1,10 +1,10 @@
 <idea-plugin>
   <id>rocks.rdil.ruby-analysis-probe</id>
   <name>Ruby Analysis Probe + Patch</name>
-  <version>0.2.0</version>
   <vendor>reece</vendor>
 
-  <idea-version since-build="262" until-build="262.*"/>
+  <!-- version, idea-version and change-notes are injected by patchPluginXml from gradle.properties
+       and CHANGELOG.md. Declaring them here too would only let them drift. -->
 
   <depends>com.intellij.modules.platform</depends>
   <depends>org.jetbrains.plugins.ruby</depends>
@@ -53,11 +53,6 @@
     unresponsive UI.</p>
   ]]></description>
 
-  <change-notes><![CDATA[
-    <p>0.2.0 — adds the runtime patches (anonymous ancestor cycle cutting, empty-lookup suppression)
-    and toggles for each. Replaces the system-properties advice indirection with direct references to
-    the bootstrap-loaded state, which is why the ancestor hook now records anything at all.</p>
-  ]]></change-notes>
 
   <extensions defaultExtensionNs="com.intellij">
     <toolWindow id="Ruby Probe"

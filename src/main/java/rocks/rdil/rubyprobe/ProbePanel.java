@@ -9,8 +9,13 @@ import javax.swing.BorderFactory;
 import javax.swing.JButton;
 import javax.swing.JPanel;
 import javax.swing.JScrollBar;
+import javax.swing.JScrollPane;
 import javax.swing.JTextArea;
+import javax.swing.SwingUtilities;
 import javax.swing.Timer;
+import javax.swing.text.Caret;
+import javax.swing.text.DefaultCaret;
+import javax.swing.text.JTextComponent;
 import java.awt.BorderLayout;
 import java.awt.FlowLayout;
 import java.awt.Font;
@@ -30,7 +35,11 @@ public final class ProbePanel extends JPanel {
     private final JBCheckBox cutCycles = new JBCheckBox("Cut anon cycles", true);
     private final JBCheckBox negativeCache = new JBCheckBox("Suppress empty lookups", true);
     private final JBCheckBox measure = new JBCheckBox("Measure", true);
+    private final JBScrollPane scrollPane = new JBScrollPane(text);
     private final Timer timer;
+
+    /** Compared instead of calling getText() on the whole document every tick. */
+    private String lastRendered = "";
 
     public ProbePanel() {
         super(new BorderLayout());
@@ -40,6 +49,7 @@ public final class ProbePanel extends JPanel {
         text.setLineWrap(false);
         text.setFont(new Font(Font.MONOSPACED, Font.PLAIN, JBUI.scaleFontSize(12)));
         text.setBorder(JBUI.Borders.empty(6));
+        freezeCaret(text);
 
         JButton copy = new JButton("Copy");
         copy.addActionListener(e -> CopyPasteManager.getInstance()
@@ -80,7 +90,7 @@ public final class ProbePanel extends JPanel {
         controls.setBorder(BorderFactory.createEmptyBorder());
 
         add(controls, BorderLayout.NORTH);
-        add(new JBScrollPane(text), BorderLayout.CENTER);
+        add(scrollPane, BorderLayout.CENTER);
 
         timer = new Timer(500, e -> refresh(false));
         timer.setRepeats(true);
@@ -98,16 +108,58 @@ public final class ProbePanel extends JPanel {
             return;
         }
         String next = ProbeInstaller.details();
-        if (next.equals(text.getText())) {
+        if (next.equals(lastRendered)) {
             return;
         }
-        // Hold the viewport steady; otherwise a periodic setText scrolls the panel out from under
-        // whatever is being read.
-        JScrollBar bar = ((JBScrollPane) ((javax.swing.JViewport) text.getParent()).getParent())
-            .getVerticalScrollBar();
-        int scroll = bar.getValue();
-        text.setText(next);
-        bar.setValue(Math.min(scroll, bar.getMaximum()));
+        lastRendered = next;
+        setTextPreservingScroll(text, scrollPane, next);
+    }
+
+    /**
+     * Stops the caret from dragging the viewport around on every update.
+     *
+     * {@code setText} is a document remove followed by an insert. A {@link DefaultCaret} on its
+     * default {@code UPDATE_WHEN_ON_EDT} policy follows the insert to the end of the new text and then
+     * calls {@code scrollRectToVisible} on itself -- end of the last line, so the view snaps to the
+     * bottom, and to that line's end, so it snaps right as well. That is the whole "jumps to the
+     * bottom right" symptom, and no amount of restoring scrollbars afterwards fixes the cause,
+     * because the caret's scroll can be deferred to a later EDT pass and simply wins.
+     */
+    static void freezeCaret(JTextComponent area) {
+        Caret caret = area.getCaret();
+        if (caret instanceof DefaultCaret) {
+            ((DefaultCaret) caret).setUpdatePolicy(DefaultCaret.NEVER_UPDATE);
+        }
+    }
+
+    /**
+     * Replaces the text without moving the viewport, horizontally or vertically.
+     *
+     * Relies on {@link #freezeCaret} having been applied; the explicit save/restore below is for the
+     * remaining case, where the new text is shorter and the scrollbar maxima shrink under the current
+     * position.
+     */
+    static void setTextPreservingScroll(JTextComponent area, JScrollPane pane, String next) {
+        JScrollBar vertical = pane.getVerticalScrollBar();
+        JScrollBar horizontal = pane.getHorizontalScrollBar();
+        int v = vertical.getValue();
+        int h = horizontal.getValue();
+
+        area.setText(next);
+
+        restoreScroll(vertical, v);
+        restoreScroll(horizontal, h);
+        // The maxima only settle once the new text has been laid out, so re-apply after that.
+        SwingUtilities.invokeLater(() -> {
+            restoreScroll(vertical, v);
+            restoreScroll(horizontal, h);
+        });
+    }
+
+    /** The largest value a scrollbar can actually hold is maximum - visibleAmount, not maximum. */
+    static void restoreScroll(JScrollBar bar, int value) {
+        int max = Math.max(0, bar.getMaximum() - bar.getVisibleAmount());
+        bar.setValue(Math.min(value, max));
     }
 
     public void dispose() {
