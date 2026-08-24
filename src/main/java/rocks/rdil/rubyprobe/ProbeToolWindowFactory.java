@@ -10,8 +10,8 @@ public final class ProbeToolWindowFactory implements ToolWindowFactory {
 
     /**
      * Called while tool windows are registered at project open, before the window is ever shown.
-     * Installing here means the agent attaches early, which matters: SymbolHierarchy gets loaded by
-     * the first analysis pass, and weaving it after that requires a retransform.
+     * Installing here means the agent attaches early, which matters: RubyStringStubIndexExtension is
+     * loaded by the first analysis pass, and weaving it after that requires a retransform.
      */
     @Override
     public boolean isApplicable(Project project) {

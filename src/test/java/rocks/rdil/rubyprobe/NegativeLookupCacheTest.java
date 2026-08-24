@@ -11,13 +11,14 @@ import java.util.Collection;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static rocks.rdil.rubyprobe.SymbolHierarchyStub.ANON;
+import static rocks.rdil.rubyprobe.ProbeFixture.ANON;
 
 /**
- * The second layer: anonymous stub keys measured to return nothing stop reaching the index.
+ * Anonymous stub keys measured to return nothing stop reaching the index.
  *
- * This is the layer that helps even if the SymbolHierarchy weaving fails, because roughly half of all
- * CPU during a stall was inside this one method returning empty.
+ * This covers the cheaper of the two anonymous-FQN failures: a merged symbol that resolves to
+ * nothing. For the expensive one -- a merged symbol that resolves to a large collision set -- see
+ * {@link BurstCutTest}, which this layer provably cannot help with.
  */
 class NegativeLookupCacheTest {
 

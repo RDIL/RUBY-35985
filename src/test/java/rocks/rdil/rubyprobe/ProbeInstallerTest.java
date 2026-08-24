@@ -60,15 +60,15 @@ class ProbeInstallerTest {
     void togglesRoundTrip() {
         ProbeInstaller.installOnce();
         try {
-            ProbeInstaller.setCutCycles(false);
-            assertEquals(false, ProbeInstaller.isCutCycles());
+            ProbeInstaller.setCutBursts(false);
+            assertEquals(false, ProbeInstaller.isCutBursts());
             ProbeInstaller.setNegativeCache(false);
             assertEquals(false, ProbeInstaller.isNegativeCache());
         } finally {
-            ProbeInstaller.setCutCycles(true);
+            ProbeInstaller.setCutBursts(true);
             ProbeInstaller.setNegativeCache(true);
         }
-        assertEquals(true, ProbeInstaller.isCutCycles());
+        assertEquals(true, ProbeInstaller.isCutBursts());
         assertEquals(true, ProbeInstaller.isNegativeCache());
     }
 }

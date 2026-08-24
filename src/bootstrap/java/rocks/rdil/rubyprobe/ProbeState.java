@@ -15,10 +15,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * Everything here must depend on nothing but the JDK.
  *
- * Two independent sources of truth, deliberately:
- *   - the woven hooks (exact, but only as good as the weaving), and
- *   - a stack sampler (approximate, but works even when weaving silently fails).
- * When the two disagree, the sampler is the one to trust.
+ * Measurement comes from a stack sampler rather than from woven hooks on ancestor resolution. There
+ * used to be both; the hook half never executed in a real IDE (see {@link ProbePatch}) and has been
+ * removed, which is why nothing here reports a "hook depth" any more.
  */
 public final class ProbeState {
 
@@ -26,9 +25,6 @@ public final class ProbeState {
     }
 
     public static volatile boolean enabled = true;
-
-    /** Resolve fully qualified symbol names at most this often per thread. */
-    private static final long NAME_SAMPLE_INTERVAL_NS = 50_000_000L;
 
     /** A thread is "active" if a hook or the sampler saw it this recently. */
     private static final long STALE_NS = 2_000_000_000L;
@@ -43,19 +39,8 @@ public final class ProbeState {
 
     public static final class Rec {
         final String threadName;
-        volatile int depth;
-        volatile int maxDepth;
-        volatile int peakDepth;
-        volatile String rootName = "";
-        volatile String rootLocation = "";
-        volatile String deepestName = "";
-        volatile String rootSymbol = "";
-        volatile String deepestSymbol = "";
-        volatile int deepestAt;
         volatile String lastStubKey = "";
         volatile long stubQueries;
-        volatile long ancestorCalls;
-        volatile long lastNameNs;
         volatile long lastActivityNs;
 
         // ---- filled in by the stack sampler, independent of any weaving ----
@@ -75,11 +60,6 @@ public final class ProbeState {
 
     private static final ConcurrentHashMap<Long, Rec> RECS = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, AtomicLong> KEY_COUNTS = new ConcurrentHashMap<>();
-    private static final ConcurrentHashMap<Class<?>, Method[]> ACCESSORS = new ConcurrentHashMap<>();
-    /** How often each top-level symbol has been resolved. Cumulative, so it is stable to read. */
-    private static final ConcurrentHashMap<String, AtomicLong> ROOT_COUNTS = new ConcurrentHashMap<>();
-    /** Source location per root symbol -- the only way to pin down an anonymous ($$ANON$..$$) one. */
-    private static final ConcurrentHashMap<String, String> ROOT_LOCATIONS = new ConcurrentHashMap<>();
     /** Declaration sites per stub key, recovered from what the index actually returned. */
     private static final ConcurrentHashMap<String, String> KEY_LOCATIONS = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, Method> ZERO_ARG = new ConcurrentHashMap<>();
@@ -105,79 +85,6 @@ public final class ProbeState {
             }
         }
         return r;
-    }
-
-    // Note: an earlier version routed the advice through a java.util.function.BiConsumer parked in
-    // System.getProperties(), on the theory that the Ruby module classloader could not resolve
-    // rocks.rdil.rubyprobe.*. It recorded nothing. Direct references from inlined advice do resolve
-    // (StubKeyAdvice has always worked that way), and a Properties table is not a dependable place
-    // to leave a non-String value, so the indirection is gone rather than fixed.
-
-    // ---------------------------------------------------------------- hot path
-
-    public static void enterAncestors(Object symbol) {
-        if (!enabled) {
-            return;
-        }
-        Rec r = TL.get();
-        if (r.describing) {
-            return;
-        }
-        int d = r.depth + 1;
-        r.depth = d;
-        r.ancestorCalls++;
-        long now = System.nanoTime();
-        r.lastActivityNs = now;
-        if (d == 1) {
-            r.maxDepth = 1;
-            String root = cheapName(r, symbol);
-            r.rootName = root;
-            AtomicLong rc = ROOT_COUNTS.get(root);
-            if (rc != null) {
-                rc.incrementAndGet();
-            } else if (ROOT_COUNTS.size() < MAX_TRACKED_KEYS) {
-                ROOT_COUNTS.computeIfAbsent(root, k -> new AtomicLong()).incrementAndGet();
-            }
-            // An anonymous symbol has no usable name, so its source location is the only handle on
-            // it. Resolve that once per distinct root rather than on every call.
-            if (!ROOT_LOCATIONS.containsKey(root) && ROOT_LOCATIONS.size() < MAX_TRACKED_KEYS) {
-                String loc = location(r, symbol);
-                ROOT_LOCATIONS.put(root, loc.isEmpty() ? "?" : loc);
-                r.rootLocation = loc;
-            } else {
-                String known = ROOT_LOCATIONS.get(root);
-                if (known != null) {
-                    r.rootLocation = known;
-                }
-            }
-        }
-        if (d > r.maxDepth) {
-            r.maxDepth = d;
-        }
-        if (d > r.peakDepth) {
-            r.peakDepth = d;
-        }
-        if (now - r.lastNameNs > NAME_SAMPLE_INTERVAL_NS) {
-            r.lastNameNs = now;
-            String desc = describe(r, symbol);
-            if (d == 1) {
-                r.rootSymbol = desc;
-            }
-            r.deepestSymbol = desc;
-            r.deepestName = cheapName(r, symbol);
-            r.deepestAt = d;
-        }
-    }
-
-    public static void exitAncestors() {
-        if (!enabled) {
-            return;
-        }
-        Rec r = TL.get();
-        if (r.describing || r.depth <= 0) {
-            return;
-        }
-        r.depth--;
     }
 
     /** The String key handed to the Ruby stub index -- literally "the thing it is looking for". */
@@ -394,7 +301,7 @@ public final class ProbeState {
             }
             String text = "===== " + java.time.LocalDateTime.now()
                 + "  stalled " + (worst / 1_000_000_000L) + "s =====\n"
-                + details() + "\n" + roots() + "\n" + keys() + "\n";
+                + details() + "\n" + keys() + "\n";
             java.nio.file.Files.writeString(
                 java.nio.file.Path.of(path), text,
                 java.nio.file.StandardOpenOption.CREATE,
@@ -415,64 +322,6 @@ public final class ProbeState {
         String cn = f.getClassName();
         int dot = cn.lastIndexOf('.');
         return (dot < 0 ? cn : cn.substring(dot + 1)) + "." + f.getMethodName();
-    }
-
-    // ------------------------------------------------------------ name lookup
-
-    private static String describe(Rec r, Object symbol) {
-        if (symbol == null) {
-            return "(null)";
-        }
-        r.describing = true;
-        try {
-            Method[] acc = ACCESSORS.computeIfAbsent(symbol.getClass(), ProbeState::findAccessors);
-            if (acc[0] != null) {
-                Object fqn = acc[0].invoke(symbol);
-                if (fqn != null) {
-                    if (acc[2] != null) {
-                        Object path = acc[2].invoke(fqn);
-                        if (path != null && !path.toString().isEmpty()) {
-                            return path.toString();
-                        }
-                    }
-                    if (!fqn.toString().isEmpty()) {
-                        return fqn.toString();
-                    }
-                }
-            }
-            if (acc[1] != null) {
-                Object n = acc[1].invoke(symbol);
-                if (n != null && !n.toString().isEmpty()) {
-                    return n.toString();
-                }
-            }
-            return "<" + symbol.getClass().getSimpleName() + ">";
-        } catch (Throwable t) {
-            return "<" + symbol.getClass().getSimpleName() + ">";
-        } finally {
-            r.describing = false;
-        }
-    }
-
-    private static String cheapName(Rec r, Object symbol) {
-        if (symbol == null) {
-            return "(null)";
-        }
-        r.describing = true;
-        try {
-            Method[] acc = ACCESSORS.computeIfAbsent(symbol.getClass(), ProbeState::findAccessors);
-            if (acc[1] != null) {
-                Object n = acc[1].invoke(symbol);
-                if (n != null && !n.toString().isEmpty()) {
-                    return n.toString();
-                }
-            }
-            return "<" + symbol.getClass().getSimpleName() + ">";
-        } catch (Throwable t) {
-            return "<" + symbol.getClass().getSimpleName() + ">";
-        } finally {
-            r.describing = false;
-        }
     }
 
     /**
@@ -578,38 +427,11 @@ public final class ProbeState {
         }
     }
 
-    private static Method[] findAccessors(Class<?> c) {
-        Method fqn = null;
-        Method name = null;
-        Method fullPath = null;
-        try {
-            fqn = c.getMethod("getFQNWithNesting");
-            fqn.setAccessible(true);
-            try {
-                fullPath = fqn.getReturnType().getMethod("getFullPath");
-                fullPath.setAccessible(true);
-            } catch (Throwable ignored) {
-                // fall back to FQN.toString()
-            }
-        } catch (Throwable ignored) {
-            // not a Symbol, or the API moved
-        }
-        try {
-            name = c.getMethod("getName");
-            name.setAccessible(true);
-        } catch (Throwable ignored) {
-            // ignore
-        }
-        return new Method[]{fqn, name, fullPath};
-    }
-
     // ------------------------------------------------------------- reporting
 
     private static volatile long lastSampleNs = System.nanoTime();
     private static volatile long lastStubTotal;
-    private static volatile long lastAncestorTotal;
     private static volatile double stubRate;
-    private static volatile double ancestorRate;
 
     private static void refreshRates() {
         long now = System.nanoTime();
@@ -618,16 +440,12 @@ public final class ProbeState {
             return;
         }
         long stubs = 0;
-        long anc = 0;
         for (Rec r : RECS.values()) {
             stubs += r.stubQueries;
-            anc += r.ancestorCalls;
         }
         double secs = dt / 1_000_000_000.0;
         stubRate = (stubs - lastStubTotal) / secs;
-        ancestorRate = (anc - lastAncestorTotal) / secs;
         lastStubTotal = stubs;
-        lastAncestorTotal = anc;
         lastSampleNs = now;
     }
 
@@ -645,7 +463,7 @@ public final class ProbeState {
             }
         }
         out.sort(Comparator
-            .comparingInt((Rec r) -> Math.max(r.stackAncestorDepth, r.maxDepth)).reversed()
+            .comparingInt((Rec r) -> r.stackAncestorDepth).reversed()
             .thenComparing(Comparator.comparingLong((Rec r) -> r.stubQueries).reversed()));
         return out;
     }
@@ -663,10 +481,6 @@ public final class ProbeState {
 
     private static List<KeyCount> topKeys(int n) {
         return rank(KEY_COUNTS, n);
-    }
-
-    private static List<KeyCount> topRoots(int n) {
-        return rank(ROOT_COUNTS, n);
     }
 
     private static List<KeyCount> rank(ConcurrentHashMap<String, AtomicLong> src, int n) {
@@ -691,31 +505,21 @@ public final class ProbeState {
         Rec r = active.get(0);
         StringBuilder sb = new StringBuilder("Ruby: ");
 
-        // Prefer the woven root symbol; fall back to the sampled frame, then the stub key.
-        if (!r.rootName.isEmpty()) {
-            sb.append(shorten(r.rootName, 28));
-        } else if (!r.lastStubKey.isEmpty()) {
+        if (!r.lastStubKey.isEmpty()) {
             sb.append(shorten(r.lastStubKey, 34));
         } else {
             sb.append(shorten(r.stackDeepestRubyFrame, 30));
         }
 
-        int d = Math.max(r.stackAncestorDepth, r.maxDepth);
+        int d = r.stackAncestorDepth;
         if (d > 0) {
             sb.append("  d").append(d);
-            if (r.peakDepth > d) {
-                sb.append('↑').append(r.peakDepth);
-            }
         }
         if (active.size() > 1) {
             sb.append(" ×").append(active.size());
         }
         if (stubRate > 1) {
             sb.append("  ").append(rate(stubRate)).append(" q/s");
-        }
-        long cuts = ProbePatch.cuts();
-        if (cuts > 0) {
-            sb.append("  ✂").append(rate(cuts));
         }
         return sb.toString();
     }
@@ -725,40 +529,8 @@ public final class ProbeState {
         refreshRates();
         StringBuilder sb = new StringBuilder();
         sb.append("Ruby Analysis Probe\n");
-        sb.append("stub-index queries: ").append(rate(stubRate)).append("/s   ");
-        sb.append("ancestor calls: ").append(rate(ancestorRate)).append("/s");
-        if (ancestorRate < 1 && stubRate > 1) {
-            sb.append(ProbePatch.ancestorEntries() == 0L
-                ? "   [ancestor advice never invoked -- using stack sampler]"
-                : "   [ancestor advice invoked " + ProbePatch.ancestorEntries()
-                    + "x but not counted]");
-        }
-        sb.append('\n');
+        sb.append("stub-index queries: ").append(rate(stubRate)).append("/s\n");
         sb.append(ProbePatch.report());
-
-        List<KeyCount> roots = topRoots(10);
-        if (!roots.isEmpty()) {
-            sb.append("\nmost-resolved root symbols (cumulative)\n");
-            for (KeyCount kc : roots) {
-                String loc = ROOT_LOCATIONS.get(kc.key);
-                sb.append(String.format("  %12d  %-34s %s%n",
-                    Long.valueOf(kc.count), shorten(kc.key, 34),
-                    loc == null ? "" : shorten(loc, 60)));
-            }
-            long anon = 0;
-            long total = 0;
-            for (KeyCount kc : topRoots(Integer.MAX_VALUE)) {
-                total += kc.count;
-                if (kc.key.startsWith("$$ANON$")) {
-                    anon += kc.count;
-                }
-            }
-            if (total > 0) {
-                sb.append(String.format(
-                    "  anonymous roots: %d of %d resolutions (%.0f%%)%n",
-                    Long.valueOf(anon), Long.valueOf(total), Double.valueOf(100.0 * anon / total)));
-            }
-        }
 
         List<KeyCount> keys = topKeys(8);
         if (!keys.isEmpty()) {
@@ -794,26 +566,14 @@ public final class ProbeState {
         sb.append('\n');
         for (Rec r : active) {
             sb.append(r.threadName).append('\n');
-            if (!r.rootName.isEmpty()) {
-                sb.append("    resolving  : ").append(r.rootName);
-                if (!r.rootSymbol.isEmpty() && !r.rootSymbol.equals(r.rootName)) {
-                    sb.append("   (").append(r.rootSymbol).append(')');
-                }
-                sb.append('\n');
-                String loc = r.rootLocation.isEmpty()
-                    ? ROOT_LOCATIONS.get(r.rootName) : r.rootLocation;
-                if (loc != null && !loc.isEmpty()) {
-                    sb.append("    defined at : ").append(loc).append('\n');
-                }
-            }
             if (!r.stackDeepestRubyFrame.isEmpty()) {
                 sb.append("    in (stack) : ").append(r.stackDeepestRubyFrame).append('\n');
                 sb.append("    top frame  : ").append(r.stackTopFrame).append('\n');
             }
             int sd = r.stackAncestorDepth;
-            sb.append("    depth      : hook ").append(r.maxDepth)
-              .append("  peak ").append(r.peakDepth)
-              .append("  stack ").append(sd < 0 ? "n/a" : String.valueOf(sd)).append('\n');
+            sb.append("    depth      : ")
+              .append(sd < 0 ? "n/a" : String.valueOf(sd))
+              .append("   (sampled getAncestorsCaching frames)\n");
             if (!r.lastStubKey.isEmpty()) {
                 sb.append("    last key   : ").append(shorten(r.lastStubKey, 74)).append('\n');
             }
@@ -833,30 +593,13 @@ public final class ProbeState {
         return sb.toString();
     }
 
-    /** Tab-separated root-symbol histogram with source locations, for pasting into a report. */
-    public static String roots() {
-        StringBuilder sb = new StringBuilder("count\troot\tlocation\n");
-        for (KeyCount kc : topRoots(200)) {
-            String loc = ROOT_LOCATIONS.get(kc.key);
-            sb.append(kc.count).append('\t').append(kc.key).append('\t')
-              .append(loc == null ? "" : loc).append('\n');
-        }
-        return sb.toString();
-    }
-
     public static void reset() {
         for (Rec r : RECS.values()) {
             r.stubQueries = 0;
-            r.ancestorCalls = 0;
-            r.maxDepth = r.depth;
-            r.peakDepth = r.depth;
         }
         KEY_COUNTS.clear();
         KEY_LOCATIONS.clear();
-        ROOT_COUNTS.clear();
-        ROOT_LOCATIONS.clear();
         lastStubTotal = 0;
-        lastAncestorTotal = 0;
         lastSampleNs = System.nanoTime();
         ProbePatch.resetCounters();
     }
@@ -871,14 +614,6 @@ public final class ProbeState {
 
     // The patch toggles are routed through here so the plugin needs only one reflective handle on
     // the bootstrap classloader.
-
-    public static void setCutCycles(boolean value) {
-        ProbePatch.cutCycles = value;
-    }
-
-    public static boolean isCutCycles() {
-        return ProbePatch.cutCycles;
-    }
 
     public static void setNegativeCache(boolean value) {
         ProbePatch.negativeCache = value;

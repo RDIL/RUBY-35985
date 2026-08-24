@@ -11,7 +11,7 @@ import java.util.Collection;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static rocks.rdil.rubyprobe.SymbolHierarchyStub.ANON;
+import static rocks.rdil.rubyprobe.ProbeFixture.ANON;
 
 /**
  * The layer that stops the stall this plugin was rebuilt for.

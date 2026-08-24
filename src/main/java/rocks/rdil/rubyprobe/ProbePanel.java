@@ -32,7 +32,6 @@ public final class ProbePanel extends JPanel {
 
     private final JTextArea text = new JTextArea();
     private final JBCheckBox paused = new JBCheckBox("Pause", false);
-    private final JBCheckBox cutCycles = new JBCheckBox("Cut anon cycles", true);
     private final JBCheckBox negativeCache = new JBCheckBox("Suppress empty lookups", true);
     private final JBCheckBox cutBursts = new JBCheckBox("Cut runaway bursts", true);
     private final JBCheckBox measure = new JBCheckBox("Measure", true);
@@ -64,11 +63,6 @@ public final class ProbePanel extends JPanel {
 
         // This plugin modifies IDE behaviour, so say so where it cannot be missed -- otherwise later
         // analysis oddities are easy to misattribute to RubyMine itself.
-        cutCycles.setSelected(ProbeInstaller.isCutCycles());
-        cutCycles.setToolTipText("Skip re-entrant ancestor resolution of an anonymous FQN already "
-            + "on the same thread's stack. Uncheck to restore stock RubyMine behaviour.");
-        cutCycles.addActionListener(e -> ProbeInstaller.setCutCycles(cutCycles.isSelected()));
-
         negativeCache.setSelected(ProbeInstaller.isNegativeCache());
         negativeCache.setToolTipText("Serve an empty result for anonymous stub keys measured to "
             + "return nothing, for up to 2s at a time.");
@@ -77,13 +71,13 @@ public final class ProbePanel extends JPanel {
 
         cutBursts.setSelected(ProbeInstaller.isCutBursts());
         cutBursts.setToolTipText("Serve an empty result for an anonymous stub key that one thread "
-            + "keeps requesting with no pause. This is the cycle cut applied at the stub index "
-            + "instead of at SymbolHierarchy, which is the only one of the two that is reliably "
-            + "woven. Like 'Cut anon cycles', an anonymous hierarchy may come back incomplete.");
+            + "keeps requesting with no pause. Emptying the lookup empties the element loop in "
+            + "getAncestorsFromAnonymousDefiningCalls, which is what ends the runaway recursion. "
+            + "Trade-off: an anonymous class's hierarchy may come back incomplete.");
         cutBursts.addActionListener(e -> ProbeInstaller.setCutBursts(cutBursts.isSelected()));
 
         // The fix is worth keeping on permanently; the instrumentation behind it is not. Turning
-        // this off drops the per-resolution bookkeeping while leaving both patches active.
+        // this off drops the per-lookup bookkeeping while leaving the patches active.
         measure.setToolTipText("Record symbol names, locations and histograms. Turn off to keep the "
             + "patches with none of the measurement overhead.");
         measure.addActionListener(e -> ProbeInstaller.setEnabled(measure.isSelected()));
@@ -92,7 +86,6 @@ public final class ProbePanel extends JPanel {
         controls.add(paused);
         controls.add(copy);
         controls.add(reset);
-        controls.add(cutCycles);
         controls.add(negativeCache);
         controls.add(cutBursts);
         controls.add(measure);
@@ -108,7 +101,6 @@ public final class ProbePanel extends JPanel {
 
     private String fullReport() {
         return ProbeInstaller.details()
-            + "\n---- root symbols ----\n" + ProbeInstaller.roots()
             + "\n---- stub keys ----\n" + ProbeInstaller.keys();
     }
 

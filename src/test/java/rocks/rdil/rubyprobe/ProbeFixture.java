@@ -26,6 +26,9 @@ final class ProbeFixture {
     private ProbeFixture() {
     }
 
+    /** The collided anonymous FQN measured in the field: hash 914550953, kind class. */
+    static final String ANON = "$$ANON$COTE0NTUwOTUz$$";
+
     private static boolean installed;
     private static Class<?> probePatch;
     private static Class<?> probeState;
@@ -49,12 +52,6 @@ final class ProbeFixture {
             new AgentBuilder.Default()
                 .disableClassFormatChanges()
                 .with(AgentBuilder.RedefinitionStrategy.RETRANSFORMATION)
-                .type(ElementMatchers.named(SymbolHierarchyStub.class.getName()))
-                .transform((b, t, cl, m, pd) -> b.visit(
-                    Advice.to(AncestorsCutAdvice.class)
-                        .on(ElementMatchers.namedOneOf(
-                                "getAncestorsCaching", "getAncestorsCachingAlt", "thrower")
-                            .and(ElementMatchers.takesArguments(2)))))
                 .type(ElementMatchers.named(StubIndexStub.class.getName()))
                 .transform((b, t, cl, m, pd) -> b.visit(
                     Advice.to(StubKeyAdvice.class)
@@ -88,14 +85,6 @@ final class ProbeFixture {
         }
     }
 
-    static long cuts() {
-        return (Long) call(probePatch, "cuts");
-    }
-
-    static long ancestorEntries() {
-        return (Long) call(probePatch, "ancestorEntries");
-    }
-
     static long suppressedLookups() {
         return (Long) call(probePatch, "suppressedLookups");
     }
@@ -106,10 +95,6 @@ final class ProbeFixture {
 
     static void resetCounters() {
         call(probePatch, "resetCounters");
-    }
-
-    static void setCutCycles(boolean value) {
-        call(probeState, "setCutCycles", Boolean.valueOf(value));
     }
 
     static void setCutBursts(boolean value) {
