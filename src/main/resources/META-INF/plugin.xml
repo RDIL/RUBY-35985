@@ -1,6 +1,6 @@
 <idea-plugin>
   <id>rocks.rdil.ruby-analysis-probe</id>
-  <name>Ruby Analysis Probe + Patch</name>
+  <name>Ruby Anonymous FQN Burst Guard</name>
   <vendor>reece</vendor>
 
   <!-- version, idea-version and change-notes are injected by patchPluginXml from gradle.properties
@@ -10,54 +10,42 @@
   <depends>org.jetbrains.plugins.ruby</depends>
 
   <description><![CDATA[
-    <p><b>This plugin modifies RubyMine's behaviour at runtime.</b> It works around a defect in
-    anonymous symbol identity that can stop Ruby code analysis from ever completing.</p>
+    <p><b>This plugin modifies RubyMine's behaviour at runtime.</b> It stops Ruby code analysis from
+    hanging forever on files that reference ActiveRecord models.</p>
 
     <p><b>The defect.</b> <code>AnonymousDefiningCallType.getAnonymousClassName</code> derives an
     anonymous class/module's fully-qualified name from
     <code>(textRange.hashCode() &lt;&lt; 15) ^ text.hashCode()</code> alone. The containing file is
-    not part of the identity, so N files whose anonymous defining call has identical text at an
-    identical offset — e.g. several monkeypatch files each starting with
-    <code>ActiveRecord::Base.class_eval do</code> — collapse into one symbol. That merged symbol
-    resolves to zero index elements, and ancestor resolution for it does not converge.</p>
+    not part of the identity, so every file whose anonymous defining call has identical text at an
+    identical offset — several monkeypatch files each opening with
+    <code>ActiveRecord::Base.class_eval do</code>, say — collapses into one symbol.</p>
 
-    <p>RubyMine tries to stop this twice and both guards miss.
-    <code>SymbolHierarchy.getAncestorsCaching</code> keys
-    <code>RecursionManager.doPreventingRecursion</code> on <code>Pair(symbol, invocationPoint)</code>,
-    so re-entering for the same FQN through a freshly built Symbol instance is not seen as recursion;
-    and <code>getAncestorsFromAnonymousDefiningCalls</code> checks a <code>visited</code> set that is
-    allocated per <code>getAncestorsCaching</code> call, which is the very boundary the cycle
-    crosses.</p>
+    <p>That merged symbol then resolves to <i>every</i> colliding declaration.
+    <code>SymbolHierarchy.getAncestorsFromAnonymousDefiningCalls</code> looks the FQN up and re-enters
+    ancestor resolution once per element returned, and nothing along the way can be memoized because
+    <code>RecursionManager</code> holds the stack stamp for the duration of the cycle. Eleven
+    colliding files, roughly thirteen levels deep, is not a slow computation — it is one that does not
+    finish. A measured stall spent 33.7 million index lookups on a single key.</p>
 
-    <p><b>The patches</b>, both toggleable from the tool window and both restricted to synthesized
-    <code>$$ANON</code> FQNs so ordinary resolution is untouched:</p>
+    <p><b>The fix.</b> When one anonymous FQN is requested past a threshold on one thread with no
+    pause, its stub-index lookup is served empty. An empty lookup empties the caller's element loop,
+    so nothing is expanded and the recursion ends. Restricted to synthesized <code>$$ANON</code>
+    FQNs, so ordinary constant resolution is untouched.</p>
+
+    <p><b>Trade-off:</b> a cut lookup means an anonymous class's ancestor list can come back
+    incomplete. Tunable, and disableable, via VM options:</p>
     <ul>
-      <li><i>Cut anon cycles</i> — a per-thread guard keyed on the FQN string. Re-entering
-      <code>getAncestorsCaching</code> for an anonymous FQN already being resolved on the same thread
-      returns an empty list, which is what the method itself returns when its own recursion guard
-      trips. Because the cut lands before RecursionManager is consulted, the outer frame's
-      <code>mayCacheNow()</code> is no longer forced false, so results can actually be memoized.</li>
-      <li><i>Suppress empty lookups</i> — anonymous stub keys measured to return nothing are served
-      empty for up to 2s at a time instead of re-querying the index. Roughly half of all CPU during a
-      stall was inside <code>RubyStringStubIndexExtension.getElements</code> returning nothing.</li>
+      <li><code>-Drubyprobe.disabled=true</code> — turn the patch off entirely</li>
+      <li><code>-Drubyprobe.burstMax=512</code> — lookups of one key, per thread, per burst</li>
+      <li><code>-Drubyprobe.burstQuietMillis=250</code> — pause that ends a burst</li>
     </ul>
 
-    <p><b>Known trade-off:</b> a cycle-cut ancestor list may be incomplete and is now cacheable, so
-    an anonymous class's hierarchy can be missing entries. Uncheck <i>Cut anon cycles</i> to restore
-    stock behaviour.</p>
-
-    <p>Also reports what analysis is doing: the symbol being resolved, its source location, recursion
-    depth, stub-key histograms, and how many cycles have been cut. Opens under
-    View &gt; Tool Windows &gt; Ruby Probe. While analysis is wedged for more than 10s a snapshot is
-    appended to <code>~/ruby-probe-stall.log</code> from a background thread, so the data survives an
-    unresponsive UI.</p>
+    <p>The first time the guard engages it logs one line to <code>idea.log</code>, tagged
+    <code>rubyprobe</code>.</p>
   ]]></description>
 
-
-  <extensions defaultExtensionNs="com.intellij">
-    <toolWindow id="Ruby Probe"
-                anchor="bottom"
-                canCloseContents="false"
-                factoryClass="rocks.rdil.rubyprobe.ProbeToolWindowFactory"/>
-  </extensions>
+  <applicationListeners>
+    <listener class="rocks.rdil.rubyprobe.Bootstrap"
+              topic="com.intellij.ide.AppLifecycleListener"/>
+  </applicationListeners>
 </idea-plugin>

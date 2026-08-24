@@ -3,44 +3,40 @@ package rocks.rdil.rubyprobe;
 import net.bytebuddy.asm.Advice;
 
 /**
- * Inlined into RubyStringStubIndexExtension.getElements(Project, SearchScope, String).
- *
- * The third argument is the FQN string being looked up in the stub index -- the single most direct
- * answer to "what is it looking for right now".
- *
- * This is also where the negative cache lives. RubyAnonymousDefiningCallIndex extends
- * RubyFqnStubIndexExtension extends RubyStringStubIndexExtension, so the anonymous-defining-call
- * lookups that dominated the profile all funnel through here -- and were measured returning nothing,
- * millions of times, while roughly half of all CPU sat inside this method.
+ * Inlined into {@code RubyStringStubIndexExtension.getElements(Project, SearchScope, String)}, whose
+ * third argument is the FQN being looked up.
+ * {@code RubyAnonymousDefiningCallIndex} extends {@code RubyFqnStubIndexExtension} extends
+ * {@code RubyStringStubIndexExtension}, so every anonymous-defining-call lookup funnels through
+ * here. This is also the one instrumentation point in this plugin shown to be reliably woven in a
+ * real IDE -- advice on {@code SymbolHierarchy.getAncestorsCaching} was observed woven but never
+ * entered, so the cut lives here instead.
+ * References {@link BurstGuard} directly. That resolves from inside the Ruby plugin's module
+ * classloader because the class is appended to the bootstrap classloader search at install time.
  */
 public final class StubKeyAdvice {
 
     private StubKeyAdvice() {
     }
 
+    /** Returning true skips the method body, so the index is never consulted. */
     @Advice.OnMethodEnter(suppress = Throwable.class, skipOn = Advice.OnNonDefaultValue.class)
+    @SuppressWarnings("unused")
     public static boolean enter(@Advice.Argument(2) Object key) {
-        // Counted before the skip decision, so the readout still shows what the IDE asked for and
-        // suppression is visible as "high query rate, low CPU" rather than by disappearing.
-        ProbeState.stubQuery(key);
-        return ProbePatch.shouldSkipLookup(key);
+        return BurstGuard.shouldSkipLookup(key);
     }
 
     /**
-     * The returned collection holds the PSI elements the index matched for this key -- i.e. the
-     * declarations themselves. For an anonymous symbol, whose name is only a hash, this is the one
-     * place a real source location is available.
+     * A skipped body leaves the default return value (null), and callers here iterate the result, so
+     * it has to become an empty collection rather than stay null.
      */
-    @SuppressWarnings("rawtypes")
-    @Advice.OnMethodExit(suppress = Throwable.class, onThrowable = Throwable.class)
-    public static void exit(@Advice.Argument(2) Object key,
-                            @Advice.Enter boolean skipped,
+    @SuppressWarnings({"rawtypes", "ParameterCanBeLocal", "UnusedAssignment", "unused"})
+    @Advice.OnMethodExit(suppress = Throwable.class)
+    public static void exit(@Advice.Enter boolean skipped,
                             @Advice.Return(readOnly = false) java.util.Collection returned) {
+        // this looks like a noop (modifying a parameter as a local variable) but at runtime it will
+        // be woven into the target class's bytecode directly
         if (skipped) {
             returned = java.util.Collections.emptyList();
-            return;
         }
-        ProbeState.stubResult(key, returned);
-        ProbePatch.recordLookup(key, returned);
     }
 }

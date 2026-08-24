@@ -118,15 +118,13 @@ tasks.test {
 
     // ByteBuddyAgent self-attaches. RubyMine itself ships -Djdk.attach.allowAttachSelf=true, so the
     // test JVM is configured the same way rather than relying on the helper-process fallback.
-    // headless so the Swing scroll tests cannot touch a display.
     jvmArgs(
         "-Djdk.attach.allowAttachSelf=true",
         "-XX:+EnableDynamicAgentLoading",
-        "-Djava.awt.headless=true",
     )
 
-    // Every test shares one JVM and ProbePatch's statics, so weaving happens once and the guard
-    // state is reset per test. Parallel execution would make that racy.
+    // Every test shares one JVM, one weave, and BurstGuard's per-thread state. Parallel execution
+    // would make the per-key counts racy.
     maxParallelForks = 1
 
     val bootJar = bootstrapJar.flatMap { it.archiveFile }
