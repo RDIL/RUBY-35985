@@ -34,6 +34,7 @@ public final class ProbePanel extends JPanel {
     private final JBCheckBox paused = new JBCheckBox("Pause", false);
     private final JBCheckBox cutCycles = new JBCheckBox("Cut anon cycles", true);
     private final JBCheckBox negativeCache = new JBCheckBox("Suppress empty lookups", true);
+    private final JBCheckBox cutBursts = new JBCheckBox("Cut runaway bursts", true);
     private final JBCheckBox measure = new JBCheckBox("Measure", true);
     private final JBScrollPane scrollPane = new JBScrollPane(text);
     private final Timer timer;
@@ -74,6 +75,13 @@ public final class ProbePanel extends JPanel {
         negativeCache.addActionListener(
             e -> ProbeInstaller.setNegativeCache(negativeCache.isSelected()));
 
+        cutBursts.setSelected(ProbeInstaller.isCutBursts());
+        cutBursts.setToolTipText("Serve an empty result for an anonymous stub key that one thread "
+            + "keeps requesting with no pause. This is the cycle cut applied at the stub index "
+            + "instead of at SymbolHierarchy, which is the only one of the two that is reliably "
+            + "woven. Like 'Cut anon cycles', an anonymous hierarchy may come back incomplete.");
+        cutBursts.addActionListener(e -> ProbeInstaller.setCutBursts(cutBursts.isSelected()));
+
         // The fix is worth keeping on permanently; the instrumentation behind it is not. Turning
         // this off drops the per-resolution bookkeeping while leaving both patches active.
         measure.setToolTipText("Record symbol names, locations and histograms. Turn off to keep the "
@@ -86,6 +94,7 @@ public final class ProbePanel extends JPanel {
         controls.add(reset);
         controls.add(cutCycles);
         controls.add(negativeCache);
+        controls.add(cutBursts);
         controls.add(measure);
         controls.setBorder(BorderFactory.createEmptyBorder());
 

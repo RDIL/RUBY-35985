@@ -56,6 +56,31 @@ public final class ProbePatch {
     public static volatile boolean negativeCache = boolProperty("rubyprobe.negativeCache", true);
 
     /**
+     * Cut a runaway anonymous-lookup burst: when one anonymous FQN is requested over and over on a
+     * single thread with no pause, serve it empty for the rest of the burst.
+     *
+     * This is the same cut as {@link #cutCycles}, applied from the stub index instead of from
+     * SymbolHierarchy, and it exists because the SymbolHierarchy advice has been observed in the
+     * field as woven-but-never-entered: the tool window reported {@code wove SymbolHierarchy
+     * (on load)} and {@code getAncestorsCaching entered : 0} simultaneously, with no linkage error.
+     * The matcher and the advice are both correct -- applying
+     * {@code named("getAncestorsCaching").and(takesArguments(2))} to the shipped SymbolHierarchy
+     * offline matches 1 of 44 methods and inlines the calls at offsets 1 and 5 -- so the failure is
+     * somewhere between the transformer and the executing class, and not something this plugin can
+     * reach. StubKeyAdvice, by contrast, is demonstrably live: it counted 33,669,997 queries for a
+     * single key during the stall this was written for.
+     *
+     * Why cutting the lookup terminates the recursion: getAncestorsFromAnonymousDefiningCalls looks
+     * the anonymous FQN up (line 553 in build 262.10315.29), then loops over the result and re-enters
+     * ancestor resolution once per element (line 556). Returning nothing for the lookup empties that
+     * loop, so no element is expanded and the cycle ends -- the same place the ancestor advice aimed
+     * for, reached from the other side.
+     *
+     * Same trade-off as {@link #cutCycles}: an anonymous class's hierarchy may come back incomplete.
+     */
+    public static volatile boolean cutBursts = boolProperty("rubyprobe.cutBursts", true);
+
+    /**
      * Only start cycle-checking at this depth. 1 (the default) checks every frame, which is both the
      * safest and the cheapest place to cut -- the cost of a cut is bounded by how much of the
      * exponential tree was already expanded before it fired.
@@ -79,6 +104,20 @@ public final class ProbePatch {
      */
     private static final int NEG_MAX_KEYS = intProperty("rubyprobe.negMaxKeys", 16384);
 
+    /**
+     * Lookups of one anonymous FQN, on one thread, with no {@link #BURST_QUIET_NS} gap, before the
+     * breaker trips. There are five orders of magnitude of headroom here: during the measured stall
+     * the runaway key was requested 33,669,997 times, while the busiest *other* key in the entire
+     * session was requested 225 times. Legitimate repeat resolution of one FQN is bounded by
+     * RubySymbolsLookupCache; a rate this high is itself the signature of the caching being defeated.
+     */
+    private static final int BURST_MAX = intProperty("rubyprobe.burstMax", 512);
+    /** A gap this long means the previous burst ended -- in practice, a new daemon pass. */
+    private static final long BURST_QUIET_NS =
+        intProperty("rubyprobe.burstQuietMillis", 250) * 1_000_000L;
+    /** Distinct anonymous keys tracked per thread. Well above any real hierarchy's fan-out. */
+    private static final int BURST_TRACKED = 64;
+
     private static final AtomicLong ENTERS = new AtomicLong();
     private static final AtomicLong ANON_ENTERS = new AtomicLong();
     private static final AtomicLong CUTS = new AtomicLong();
@@ -86,7 +125,10 @@ public final class ProbePatch {
     private static final AtomicLong NEG_SERVED = new AtomicLong();
     private static final AtomicLong NEG_ARMED = new AtomicLong();
     private static final AtomicLong DEEPEST = new AtomicLong();
+    private static final AtomicLong BURST_SERVED = new AtomicLong();
+    private static final AtomicLong BURST_TRIPS = new AtomicLong();
     private static volatile String lastCut = "";
+    private static volatile String lastBurst = "";
 
     // ------------------------------------------------------------ cycle guard
 
@@ -188,9 +230,79 @@ public final class ProbePatch {
         return (s != null && s.contains(ANON)) ? s : null;
     }
 
+    // ------------------------------------------------------------ burst guard
+
+    /**
+     * Per-thread lookup counts for anonymous FQNs, newest-hottest first. Plain arrays rather than a
+     * map: this runs on a path measured at 113.6k calls/s, so it must not allocate.
+     */
+    static final class Burst {
+        final String[] key = new String[BURST_TRACKED];
+        final int[] count = new int[BURST_TRACKED];
+        final long[] last = new long[BURST_TRACKED];
+        int n;
+    }
+
+    private static final ThreadLocal<Burst> BURST = new ThreadLocal<Burst>() {
+        @Override
+        protected Burst initialValue() {
+            return new Burst();
+        }
+    };
+
+    /**
+     * @return true when this anonymous key has been requested more than {@link #BURST_MAX} times on
+     *         this thread without a {@link #BURST_QUIET_NS} pause.
+     *
+     * Move-to-front linear scan: the runaway key is by definition the one being asked for, so it
+     * settles at index 0 and the common case is one reference comparison.
+     */
+    private static boolean burstTrip(String k) {
+        Burst b = BURST.get();
+        long now = System.nanoTime();
+        int i = 0;
+        for (; i < b.n; i++) {
+            String candidate = b.key[i];
+            if (candidate == k || candidate.equals(k)) {
+                break;
+            }
+        }
+        if (i == b.n) {
+            if (b.n < BURST_TRACKED) {
+                b.n++;
+            } else {
+                i = b.n - 1;                    // evict the coldest slot
+            }
+            b.key[i] = k;
+            b.count[i] = 0;
+        } else if (now - b.last[i] > BURST_QUIET_NS) {
+            b.count[i] = 0;                     // the previous burst ended
+        }
+        b.last[i] = now;
+        int c = ++b.count[i];
+        if (i > 0) {
+            int mc = b.count[i];
+            long ml = b.last[i];
+            System.arraycopy(b.key, 0, b.key, 1, i);
+            System.arraycopy(b.count, 0, b.count, 1, i);
+            System.arraycopy(b.last, 0, b.last, 1, i);
+            b.key[0] = k;
+            b.count[0] = mc;
+            b.last[0] = ml;
+        }
+        if (c <= BURST_MAX) {
+            return false;
+        }
+        if (c == BURST_MAX + 1) {
+            BURST_TRIPS.incrementAndGet();
+            lastBurst = k;
+        }
+        return true;
+    }
+
     // --------------------------------------------------------- negative cache
 
-    /** key -> {consecutive empty results, nanos when armed} */
+    /** key -> {consecutive empty results, nanos when armed, total empty, total non-empty} */
     private static final ConcurrentHashMap<String, long[]> ZEROS = new ConcurrentHashMap<>();
 
     /**
@@ -202,11 +314,21 @@ public final class ProbePatch {
      * empty results, with a short TTL so a key that starts resolving is not suppressed for long.
      */
     public static boolean shouldSkipLookup(Object key) {
-        if (!negativeCache || !(key instanceof String)) {
+        if (!(key instanceof String)) {
             return false;
         }
         String k = (String) key;
         if (!k.contains(ANON)) {
+            return false;
+        }
+        // Ahead of the negative cache on purpose: the runaway key is NOT a negative lookup -- it
+        // resolves to a real, non-empty collision set -- so the negative cache correctly declines to
+        // arm on it and cannot be what stops it.
+        if (cutBursts && burstTrip(k)) {
+            BURST_SERVED.incrementAndGet();
+            return true;
+        }
+        if (!negativeCache) {
             return false;
         }
         long[] e = ZEROS.get(k);
@@ -229,7 +351,7 @@ public final class ProbePatch {
 
     /** Feeds the negative cache with what the index actually returned. */
     public static void recordLookup(Object key, Object result) {
-        if (!negativeCache || !(key instanceof String)) {
+        if (!(key instanceof String)) {
             return;
         }
         String k = (String) key;
@@ -240,10 +362,14 @@ public final class ProbePatch {
             || (result instanceof Collection && ((Collection<?>) result).isEmpty());
         long[] e = ZEROS.get(k);
         if (e == null) {
-            if (!empty || ZEROS.size() >= NEG_MAX_KEYS) {
+            // Non-empty keys are tracked too now. They can never arm the negative cache (their
+            // consecutive-empty count stays 0), but slots 2 and 3 give the report a LIVE
+            // empty/non-empty tally -- which is the fact that was missing when a stale
+            // "(no elements returned)" label was read as "the index found nothing".
+            if (ZEROS.size() >= NEG_MAX_KEYS) {
                 return;
             }
-            e = new long[]{0L, 0L};
+            e = new long[]{0L, 0L, 0L, 0L};
             long[] prev = ZEROS.putIfAbsent(k, e);
             if (prev != null) {
                 e = prev;
@@ -251,7 +377,12 @@ public final class ProbePatch {
         }
         synchronized (e) {
             if (!empty) {
+                e[3]++;
                 e[0] = 0L;
+                return;
+            }
+            e[2]++;
+            if (!negativeCache) {
                 return;
             }
             e[0]++;
@@ -264,6 +395,33 @@ public final class ProbePatch {
         }
     }
 
+    /**
+     * Live empty/non-empty tally for an anonymous key, or "" when untracked.
+     *
+     * The report's "declared at" line is a first-sighting snapshot that is never revised, so for a
+     * key first seen during indexing it can say "(no elements returned)" forever while every
+     * subsequent lookup returns a full collision set. This is measured on every lookup instead.
+     */
+    public static String verdict(String key) {
+        if (key == null) {
+            return "";
+        }
+        long[] e = ZEROS.get(key);
+        if (e == null) {
+            return "";
+        }
+        long emptyCount;
+        long nonEmptyCount;
+        synchronized (e) {
+            emptyCount = e[2];
+            nonEmptyCount = e[3];
+        }
+        if (emptyCount == 0L && nonEmptyCount == 0L) {
+            return "";
+        }
+        return emptyCount + " empty / " + nonEmptyCount + " non-empty";
+    }
+
     // -------------------------------------------------------------- reporting
 
     public static long cuts() {
@@ -272,6 +430,14 @@ public final class ProbePatch {
 
     public static long suppressedLookups() {
         return NEG_SERVED.get();
+    }
+
+    public static long burstSuppressedLookups() {
+        return BURST_SERVED.get();
+    }
+
+    public static long burstTrips() {
+        return BURST_TRIPS.get();
     }
 
     public static long ancestorEntries() {
@@ -284,6 +450,8 @@ public final class ProbePatch {
         sb.append("  cut anonymous cycles : ").append(cutCycles ? "ON" : "off")
           .append("      negative lookup cache : ").append(negativeCache ? "ON" : "off")
           .append('\n');
+        sb.append("  cut runaway bursts   : ").append(cutBursts ? "ON" : "off")
+          .append("      (threshold ").append(BURST_MAX).append(" lookups/key/thread/burst)\n");
         long enters = ENTERS.get();
         sb.append("  getAncestorsCaching entered : ").append(enters);
         if (enters == 0L) {
@@ -300,6 +468,11 @@ public final class ProbePatch {
           .append("   (keys armed: ").append(NEG_ARMED.get())
           .append(" of ").append(NEG_MAX_KEYS).append(" max, ").append(ZEROS.size())
           .append(" tracked)\n");
+        sb.append("  runaway bursts cut          : ").append(BURST_TRIPS.get())
+          .append("   (lookups served empty: ").append(BURST_SERVED.get()).append(")\n");
+        if (!lastBurst.isEmpty()) {
+            sb.append("  last burst key              : ").append(lastBurst).append('\n');
+        }
         String adviceError = null;
         try {
             adviceError = System.getProperty("rubyprobe.adviceError");
@@ -325,7 +498,13 @@ public final class ProbePatch {
         NEG_SERVED.set(0L);
         NEG_ARMED.set(0L);
         DEEPEST.set(0L);
+        BURST_SERVED.set(0L);
+        BURST_TRIPS.set(0L);
         lastCut = "";
+        lastBurst = "";
+        Burst b = BURST.get();          // this thread only; per-thread state has no global handle
+        java.util.Arrays.fill(b.key, null);
+        b.n = 0;
         ZEROS.clear();
     }
 

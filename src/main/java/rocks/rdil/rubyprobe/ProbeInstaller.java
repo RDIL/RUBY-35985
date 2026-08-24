@@ -52,6 +52,8 @@ public final class ProbeInstaller {
     private static volatile Method isCutCyclesMethod;
     private static volatile Method negativeCacheMethod;
     private static volatile Method isNegativeCacheMethod;
+    private static volatile Method cutBurstsMethod;
+    private static volatile Method isCutBurstsMethod;
 
     private ProbeInstaller() {
     }
@@ -89,6 +91,9 @@ public final class ProbeInstaller {
             isCutCyclesMethod = probeState.getMethod("isCutCycles");
             negativeCacheMethod = probeState.getMethod("setNegativeCache", boolean.class);
             isNegativeCacheMethod = probeState.getMethod("isNegativeCache");
+
+            cutBurstsMethod = probeState.getMethod("setCutBursts", boolean.class);
+            isCutBurstsMethod = probeState.getMethod("isCutBursts");
 
             new AgentBuilder.Default()
                 .disableClassFormatChanges()
@@ -357,6 +362,10 @@ public final class ProbeInstaller {
         set(negativeCacheMethod, value);
     }
 
+    public static void setCutBursts(boolean value) {
+        set(cutBurstsMethod, value);
+    }
+
     /** Defaults to true so the checkbox reads correctly before the agent has installed. */
     public static boolean isCutCycles() {
         return get(isCutCyclesMethod);
@@ -364,6 +373,10 @@ public final class ProbeInstaller {
 
     public static boolean isNegativeCache() {
         return get(isNegativeCacheMethod);
+    }
+
+    public static boolean isCutBursts() {
+        return get(isCutBurstsMethod);
     }
 
     private static void set(Method m, boolean value) {

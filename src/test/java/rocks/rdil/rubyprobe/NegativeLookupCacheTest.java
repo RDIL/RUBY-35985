@@ -34,6 +34,9 @@ class NegativeLookupCacheTest {
     void reset() {
         ProbeFixture.resetCounters();
         ProbeFixture.setNegativeCache(true);
+        // Off for this class: the burst breaker would also serve these lookups empty, and then the
+        // counts below would no longer isolate the layer under test.
+        ProbeFixture.setCutBursts(false);
         StubIndexStub.resetObserved();
         index = new StubIndexStub();
     }
@@ -41,6 +44,7 @@ class NegativeLookupCacheTest {
     @AfterEach
     void restoreDefaults() {
         ProbeFixture.setNegativeCache(true);
+        ProbeFixture.setCutBursts(true);
     }
 
     @Test

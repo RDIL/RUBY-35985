@@ -227,10 +227,19 @@ public final class ProbeState {
         }
         StringBuilder sb = new StringBuilder();
         int n = 0;
+        int elements = 0;
+        boolean truncated = false;
         try {
             for (Object element : (Iterable<?>) result) {
                 if (element == null) {
                     continue;
+                }
+                if (++elements > 256) {
+                    truncated = true;           // bounded: this only informs a label
+                    break;
+                }
+                if (n >= 3) {
+                    continue;                   // keep counting elements, stop resolving locations
                 }
                 String loc = location(r, element);
                 if (!loc.isEmpty()) {
@@ -238,15 +247,26 @@ public final class ProbeState {
                         sb.append("  |  ");
                     }
                     sb.append(loc);
-                    if (++n >= 3) {
-                        break;
-                    }
+                    n++;
                 }
             }
         } catch (Throwable ignored) {
             // a partial answer is still useful
         }
-        KEY_LOCATIONS.put(k, n == 0 ? "(no elements returned)" : sb.toString());
+        // These two used to collapse into one string. They are opposites: "the index found nothing"
+        // versus "the index found plenty and none of it could be rendered". Reading the second as
+        // the first is what makes a non-empty runaway key look like a negative-lookup problem.
+        String label;
+        if (elements == 0) {
+            label = "(no elements returned)";
+        } else if (n == 0) {
+            label = "(" + elements + (truncated ? "+" : "") + " element(s), no location resolved)";
+        } else if (elements > n) {
+            label = sb + "   [" + elements + (truncated ? "+" : "") + " elements total]";
+        } else {
+            label = sb.toString();
+        }
+        KEY_LOCATIONS.put(k, label);
     }
 
     // ------------------------------------------------------------- stack sampler
@@ -750,6 +770,13 @@ public final class ProbeState {
                 if (loc != null) {
                     sb.append("                declared at ").append(shorten(loc, 100)).append('\n');
                 }
+                // KEY_LOCATIONS is written once, on a key's first sighting, and never revised. For a
+                // key first seen while indexing, it can read "(no elements returned)" forever while
+                // every lookup since has returned a full collision set. This line is measured live.
+                String verdict = ProbePatch.verdict(kc.key);
+                if (!verdict.isEmpty()) {
+                    sb.append("                live        ").append(verdict).append('\n');
+                }
             }
             if (KEY_COUNTS.size() >= MAX_TRACKED_KEYS) {
                 sb.append("  (key table full at ").append(MAX_TRACKED_KEYS)
@@ -859,6 +886,14 @@ public final class ProbeState {
 
     public static boolean isNegativeCache() {
         return ProbePatch.negativeCache;
+    }
+
+    public static void setCutBursts(boolean value) {
+        ProbePatch.cutBursts = value;
+    }
+
+    public static boolean isCutBursts() {
+        return ProbePatch.cutBursts;
     }
 
     private static String rate(double v) {

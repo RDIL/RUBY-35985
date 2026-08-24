@@ -112,6 +112,18 @@ final class ProbeFixture {
         call(probeState, "setCutCycles", Boolean.valueOf(value));
     }
 
+    static void setCutBursts(boolean value) {
+        call(probeState, "setCutBursts", Boolean.valueOf(value));
+    }
+
+    static long burstSuppressed() {
+        return (Long) call(probePatch, "burstSuppressedLookups");
+    }
+
+    static long burstTrips() {
+        return (Long) call(probePatch, "burstTrips");
+    }
+
     static void setNegativeCache(boolean value) {
         call(probeState, "setNegativeCache", Boolean.valueOf(value));
     }
